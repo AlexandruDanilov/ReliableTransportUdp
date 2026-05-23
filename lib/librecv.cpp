@@ -17,6 +17,9 @@ struct pollfd data_fds[MAX_CONNECTIONS];
 /* Used for timers per connection */
 struct pollfd timer_fds[MAX_CONNECTIONS];
 int fdmax = 0;
+int listen_sockfd = -1;
+int max_recv_buffer_bytes = 0;
+int next_connection_id = 0;
 
 int recv_data(int conn_id, char *buffer, int len)
 {
@@ -110,6 +113,17 @@ void init_receiver(int recv_buffer_bytes)
     int ret;
 
     /* TODO: Create the connection socket and bind it to 8031 */
+
+    max_recv_buffer_bytes = recv_buffer_bytes;
+    listen_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(listen_sockfd >= 0);
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(8031);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    ret = bind(listen_sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    assert(ret == 0);
 
     ret = pthread_create( &thread1, NULL, receiver_handler, NULL);
     assert(ret == 0);
