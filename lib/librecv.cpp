@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <cassert>
 #include <sys/timerfd.h>
+#include <cstring>
 
 using namespace std;
 
@@ -66,7 +67,7 @@ int wait4connect(uint32_t ip, uint16_t port)
      * until a connection is established. */
 
     struct connection *con = (struct connection *)malloc(sizeof(struct connection));
-    int conn_id = 0;
+    int conn_id = next_connection_id++;
 
     /* This can be used to set a timer on a socket, useful once we received a
      * SYN. You may want to disable by setting the time to 0 (tv_sec = 0,
@@ -78,9 +79,64 @@ int wait4connect(uint32_t ip, uint16_t port)
         perror("Error");
     } */
 
+    char buffer[MAX_SEGMENT_SIZE];
+    struct sockaddr_in cliaddr;
+    socklen_t clilen = sizeof(cliaddr);
+
+    DEBUG_PRINT("Waiting for SYN\n");
+
+    while (true) {
+        int n = recvfrom(listen_sockfd, buffer, MAX_SEGMENT_SIZE, MSG_WAITALL, (struct sockaddr *) &cliaddr , &clilen);
+        if (n > 0) {
+            poli_tcp_ctrl_hdr *header = (poli_tcp_ctrl_hdr *)buffer;
+            if (header->type == 1) {
+                DEBUG_PRINT("Received SYN\n");
+                break;
+            }
+            
+        }
+    }
+
     /* Receive SYN on the connection socket. Create a new socket and bind it to
      * the chosen port. Send the data port number via SYN-ACK to the client */
     con->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in new_server_addr;
+    new_server_addr.sin_family = AF_INET;
+    new_server_addr.sin_port = htons(0);
+    new_server_addr.sin_addr.s_addr = INADDR_ANY;
+    bind(con->sockfd, (struct sockaddr *)&new_server_addr, sizeof(new_server_addr));
+
+    socklen_t len = sizeof(new_server_addr);
+    getsockname(con->sockfd, (struct sockaddr *)&new_server_addr, &len);
+    int new_port = ntohs(new_server_addr.sin_port);
+
+    char syn_ack[MAX_SEGMENT_SIZE];
+    poli_tcp_ctrl_hdr *syn_ack_header = (poli_tcp_ctrl_hdr *)syn_ack;
+    syn_ack_header->protocol_id = POLI_PROTOCOL_ID;
+    syn_ack_header->conn_id = conn_id;
+    syn_ack_header->type = 2;
+    syn_ack_header->ack_num = 0;
+    syn_ack_header->recv_window = max_recv_buffer_bytes;
+
+    memcpy(syn_ack + sizeof(poli_tcp_ctrl_hdr), &new_port, sizeof(uint16_t));
+    sendto(listen_sockfd, syn_ack, sizeof(poli_tcp_ctrl_hdr) + sizeof(uint16_t), MSG_CONFIRM, (const struct sockaddr *) &cliaddr, clilen);
+
+    while (true) {
+        int n = recvfrom(con->sockfd, buffer, MAX_SEGMENT_SIZE, MSG_WAITALL, (struct sockaddr *) &cliaddr , &clilen);
+        if (n > 0) {
+            poli_tcp_ctrl_hdr *header = (poli_tcp_ctrl_hdr *)buffer;
+            if (header->type == 3) {
+                DEBUG_PRINT("Received ACK, connection established\n");
+                break;
+            }
+        }
+    }
+
+    con->servaddr = cliaddr;
+    con->conn_id = conn_id;
+    con->state = 2;
+    con->expected_sequence_number = 0;
+    con->recv_window_bytes = max_recv_buffer_bytes;
 
     /* Since we can have multiple connection, we want to know if data is available
        on the socket used by a given connection. We use POLL for this */
@@ -104,7 +160,7 @@ int wait4connect(uint32_t ip, uint16_t port)
 
     DEBUG_PRINT("Connection established!");
 
-    return 0;
+    return conn_id;
 }
 
 void init_receiver(int recv_buffer_bytes)

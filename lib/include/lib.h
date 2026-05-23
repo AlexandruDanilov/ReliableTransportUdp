@@ -21,12 +21,15 @@ struct connection {
     int conn_id; /* connection identifier */
     struct sockaddr_in servaddr; /* used to identify the destination */
     pthread_mutex_t con_lock; /* Used for syncronization with the handler thread and read/send calls.*/
+    int state; /* 0 is closed, 1 is handshake, 2 is established */
 
     /* TODO. Parameters used only by the sender */
     int max_window_seq; /* Used to store the max number of packets that can be inflight, since we can
                            have many more packets in our window */
 
     /* TODO. Parameters used only by the client */
+    int expected_sequence_number;
+    int recv_window_bytes;
 };
 
 /* ########## API that we expose to the application ########### */
