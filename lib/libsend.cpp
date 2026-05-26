@@ -8,6 +8,7 @@
 #include <cassert>
 #include <poll.h>
 #include <sys/timerfd.h>
+#include <cstring>
 
 using namespace std;
 
@@ -17,6 +18,8 @@ struct pollfd data_fds[MAX_CONNECTIONS];
 /* Used for timers per connection */
 struct pollfd timer_fds[MAX_CONNECTIONS];
 int fdmax = 0;
+int global_speed = 0;
+int global_delay = 0;
 
 int send_data(int conn_id, char *buffer, int len)
 {
@@ -77,6 +80,56 @@ int setup_connection(uint32_t ip, uint16_t port)
      * port. We can use con->sockfd for both cases, but we will need to update server_addr
      * with the port received via SYN-ACK */
 
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = port;
+    server_addr.sin_addr.s_addr = ip;
+
+    poli_tcp_ctrl_hdr header;
+    header.type = 1; /* SYN */
+    header.protocol_id = POLI_PROTOCOL_ID;
+    sendto(con->sockfd, &header, sizeof(header), MSG_CONFIRM, (const struct sockaddr *) &server_addr, sizeof(server_addr));
+
+    DEBUG_PRINT("SYN sent\n");
+
+    char buffer[MAX_SEGMENT_SIZE];
+    struct sockaddr_in from_addr;
+    socklen_t from_len = sizeof(from_addr);
+    uint16_t new_port;
+
+    while (true) {
+        int n = recvfrom(con->sockfd, buffer, MAX_SEGMENT_SIZE, 0, (struct sockaddr *)&from_addr, &from_len);
+        if (n > 0) {
+            poli_tcp_ctrl_hdr *header = (poli_tcp_ctrl_hdr *)buffer;
+            if (header->type == 2) { 
+                conn_id = header->conn_id;
+                con->recv_window_bytes = header->recv_window;
+                memcpy(&new_port, buffer + sizeof(poli_tcp_ctrl_hdr), sizeof(uint16_t));
+                DEBUG_PRINT("Received SYN-ACK, new port is %d\n", new_port);
+                break;
+            }
+        }
+    }
+
+    server_addr.sin_port = htons(new_port);
+    con->servaddr = server_addr;
+    poli_tcp_ctrl_hdr syn_ack_header;
+    syn_ack_header.protocol_id = POLI_PROTOCOL_ID;
+    syn_ack_header.conn_id = conn_id;
+    syn_ack_header.type = 3;
+    sendto(con->sockfd, &syn_ack_header, sizeof(syn_ack_header), MSG_CONFIRM, (const struct sockaddr *) &server_addr, sizeof(server_addr));
+
+    DEBUG_PRINT("ACK sent, connection established\n");
+
+    con->conn_id = conn_id;
+    con->state = 2;
+
+    int sliding_window_bytes = (global_speed * 1000000 / 8) * (global_delay * 2) / 1000;
+    con->max_window_seq = sliding_window_bytes / MAX_SEGMENT_SIZE;
+    if (con->max_window_seq < 10) {
+        con->max_window_seq = 10;
+    }
+
     /* Since we can have multiple connection, we want to know if data is available
        on the socket used by a given connection. We use POLL for this */
     data_fds[fdmax].fd = con->sockfd;    
@@ -100,13 +153,16 @@ int setup_connection(uint32_t ip, uint16_t port)
 
     DEBUG_PRINT("Connection established!");
 
-    return 0;
+    return conn_id;
 }
 
 void init_sender(int speed, int delay)
 {
     pthread_t thread1;
     int ret;
+
+    global_speed = speed;
+    global_delay = delay;
 
     /* Create a thread that will*/
     ret = pthread_create( &thread1, NULL, sender_handler, NULL);
