@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <sys/timerfd.h>
 #include <cstring>
+#include <unistd.h>
 
 using namespace std;
 
@@ -21,17 +22,63 @@ int fdmax = 0;
 int global_speed = 0;
 int global_delay = 0;
 
+struct simple_packet {
+    char data[MAX_SEGMENT_SIZE];
+    int size;
+};
+
+std::map<int, std::map<int, simple_packet>> unacked_packets;
+std::map<int, int> base_seq; 
+std::map<int, int> next_seq; 
+
 int send_data(int conn_id, char *buffer, int len)
 {
-    int size = 0;
+    struct connection *con = cons[conn_id];
+    int bytes_sent = 0;
 
-    pthread_mutex_lock(&cons[conn_id]->con_lock);
+    if (next_seq.find(conn_id) == next_seq.end()) {
+        next_seq[conn_id] = 0;
+        base_seq[conn_id] = 0;
+    }
 
-    /* We will write code here as to not have sync problems with sender_handler */
+    while (bytes_sent < len) {
+        pthread_mutex_lock(&con->con_lock);
 
-    pthread_mutex_unlock(&cons[conn_id]->con_lock);
+        /* We will write code here as to not have sync problems with sender_handler */
+        if (next_seq[conn_id] >= base_seq[conn_id] + con->max_window_seq) {
+            pthread_mutex_unlock(&con->con_lock);
+            usleep(1000); 
+            continue;
+        }
 
-    return size;
+        int chunk_size = len - bytes_sent;
+        if (chunk_size > MAX_DATA_SIZE) {
+            chunk_size = MAX_DATA_SIZE;
+        }
+
+        simple_packet pkt;
+        pkt.size = sizeof(poli_tcp_data_hdr) + chunk_size;
+        
+        poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)pkt.data;
+        hdr->protocol_id = POLI_PROTOCOL_ID;
+        hdr->conn_id = conn_id;
+        hdr->type = 4;
+        hdr->seq_num = next_seq[conn_id];
+        hdr->len = chunk_size;
+
+        memcpy(pkt.data + sizeof(poli_tcp_data_hdr), buffer + bytes_sent, chunk_size);
+
+        unacked_packets[conn_id][next_seq[conn_id]] = pkt;
+
+        sendto(con->sockfd, pkt.data, pkt.size, 0, (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
+
+        next_seq[conn_id]++;
+        bytes_sent += chunk_size;
+
+        pthread_mutex_unlock(&con->con_lock);
+    }
+
+    return bytes_sent;
 }
 
 void *sender_handler(void *arg)
@@ -42,21 +89,43 @@ void *sender_handler(void *arg)
     while (1) {
 
         if (cons.size() == 0) {
+            usleep(1000);
             continue;
         }
         int conn_id = -1;
-        do {
-            res = recv_message_or_timeout(buf, MAX_SEGMENT_SIZE, &conn_id);
-        } while(res == -14);
-
-        pthread_mutex_lock(&cons[conn_id]->con_lock);
 
         /* Handle segment received from the receiver. We use this between locks
         as to not have synchronization issues with the send_data calls which are
         on the main thread */
+        res = recv_message_or_timeout(buf, MAX_SEGMENT_SIZE, &conn_id);
 
-        pthread_mutex_unlock(&cons[conn_id]->con_lock);
+        if (res > 0 && conn_id >= 0 && cons.find(conn_id) != cons.end()) {
+            pthread_mutex_lock(&cons[conn_id]->con_lock);
+
+            poli_tcp_ctrl_hdr *hdr = (poli_tcp_ctrl_hdr *)buf;
+            if (hdr->type == 3) { 
+                int ack_num = hdr->ack_num;
+                unacked_packets[conn_id].erase(ack_num);
+
+                while (next_seq[conn_id] > base_seq[conn_id] && 
+                       unacked_packets[conn_id].find(base_seq[conn_id]) == unacked_packets[conn_id].end()) {
+                    base_seq[conn_id]++;
+                }
+            }
+            pthread_mutex_unlock(&cons[conn_id]->con_lock);
+        }
+
+        if (res == -14) {
+            for (auto const& [cid, con] : cons) {
+                pthread_mutex_lock(&con->con_lock);
+                for (auto& [seq, pkt] : unacked_packets[cid]) {
+                    sendto(con->sockfd, pkt.data, pkt.size, 0, (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
+                }
+                pthread_mutex_unlock(&con->con_lock);
+            }
+        }
     }
+    return NULL;
 }
 
 int setup_connection(uint32_t ip, uint16_t port)
@@ -76,7 +145,7 @@ int setup_connection(uint32_t ip, uint16_t port)
         perror("Error");
     } */
 
-    /* We will send the SYN on 8031. Then we will receive a SYN-ACK with the connection
+    /* We will send the SYN on 8032. Then we will receive a SYN-ACK with the connection
      * port. We can use con->sockfd for both cases, but we will need to update server_addr
      * with the port received via SYN-ACK */
 
@@ -88,25 +157,30 @@ int setup_connection(uint32_t ip, uint16_t port)
     poli_tcp_ctrl_hdr header;
     header.type = 1; /* SYN */
     header.protocol_id = POLI_PROTOCOL_ID;
-    sendto(con->sockfd, &header, sizeof(header), MSG_CONFIRM, (const struct sockaddr *) &server_addr, sizeof(server_addr));
-
-    DEBUG_PRINT("SYN sent\n");
 
     char buffer[MAX_SEGMENT_SIZE];
     struct sockaddr_in from_addr;
     socklen_t from_len = sizeof(from_addr);
-    uint16_t new_port;
+    uint16_t new_port = 0;
 
     while (true) {
-        int n = recvfrom(con->sockfd, buffer, MAX_SEGMENT_SIZE, 0, (struct sockaddr *)&from_addr, &from_len);
-        if (n > 0) {
-            poli_tcp_ctrl_hdr *header = (poli_tcp_ctrl_hdr *)buffer;
-            if (header->type == 2) { 
-                conn_id = header->conn_id;
-                con->recv_window_bytes = header->recv_window;
-                memcpy(&new_port, buffer + sizeof(poli_tcp_ctrl_hdr), sizeof(uint16_t));
-                DEBUG_PRINT("Received SYN-ACK, new port is %d\n", new_port);
-                break;
+
+        sendto(con->sockfd, &header, sizeof(header), 0, (const struct sockaddr *) &server_addr, sizeof(server_addr));
+        
+        struct pollfd pfd;
+        pfd.fd = con->sockfd;
+        pfd.events = POLLIN;
+        int p = poll(&pfd, 1, 10);
+        if (p > 0) {
+            int n = recvfrom(con->sockfd, buffer, MAX_SEGMENT_SIZE, 0, (struct sockaddr *)&from_addr, &from_len);
+            if (n > 0) {
+                poli_tcp_ctrl_hdr *recv_hdr = (poli_tcp_ctrl_hdr *)buffer;
+                if (recv_hdr->type == 2) { 
+                    conn_id = recv_hdr->conn_id;
+                    con->recv_window_bytes = recv_hdr->recv_window;
+                    memcpy(&new_port, buffer + sizeof(poli_tcp_ctrl_hdr), sizeof(uint16_t));
+                    break;
+                }
             }
         }
     }
@@ -117,18 +191,17 @@ int setup_connection(uint32_t ip, uint16_t port)
     syn_ack_header.protocol_id = POLI_PROTOCOL_ID;
     syn_ack_header.conn_id = conn_id;
     syn_ack_header.type = 3;
-    sendto(con->sockfd, &syn_ack_header, sizeof(syn_ack_header), MSG_CONFIRM, (const struct sockaddr *) &server_addr, sizeof(server_addr));
 
-    DEBUG_PRINT("ACK sent, connection established\n");
+    sendto(con->sockfd, &syn_ack_header, sizeof(syn_ack_header), 0, (const struct sockaddr *) &server_addr, sizeof(server_addr));
 
     con->conn_id = conn_id;
     con->state = 2;
 
     int sliding_window_bytes = (global_speed * 1000000 / 8) * (global_delay * 2) / 1000;
     con->max_window_seq = sliding_window_bytes / MAX_SEGMENT_SIZE;
-    if (con->max_window_seq < 10) {
-        con->max_window_seq = 10;
-    }
+    
+    if (con->max_window_seq < 10) con->max_window_seq = 10;
+    if (con->max_window_seq > 50) con->max_window_seq = 50; 
 
     /* Since we can have multiple connection, we want to know if data is available
        on the socket used by a given connection. We use POLL for this */

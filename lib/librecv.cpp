@@ -9,10 +9,13 @@
 #include <cassert>
 #include <sys/timerfd.h>
 #include <cstring>
+#include <unistd.h>
+#include <string>
 
 using namespace std;
 
 std::map<int, struct connection *> cons;
+std::map<int, std::string> recv_buffers[MAX_CONNECTIONS];
 
 struct pollfd data_fds[MAX_CONNECTIONS];
 /* Used for timers per connection */
@@ -26,11 +29,33 @@ int recv_data(int conn_id, char *buffer, int len)
 {
     int size = 0;
 
-    pthread_mutex_lock(&cons[conn_id]->con_lock);
-    
     /* We will write code here as to not have sync problems with recv_handler */
+    while (size == 0) {
+        pthread_mutex_lock(&cons[conn_id]->con_lock);
 
-    pthread_mutex_unlock(&cons[conn_id]->con_lock);
+        int expected_seq = cons[conn_id]->expected_sequence_number;
+
+        if (recv_buffers[conn_id].count(expected_seq)) {
+            std::string payload = recv_buffers[conn_id][expected_seq];
+
+            int to_copy = len;
+            if ((int)payload.size() < to_copy) {
+                to_copy = payload.size();
+            }
+
+            memcpy(buffer, payload.data(), to_copy);
+            size = to_copy;
+
+            recv_buffers[conn_id].erase(expected_seq);
+            cons[conn_id]->expected_sequence_number++;
+        }
+
+        pthread_mutex_unlock(&cons[conn_id]->con_lock);
+
+        if (size == 0) {
+            usleep(1000);
+        }
+    }
 
     return size;
 }
@@ -40,7 +65,7 @@ void *receiver_handler(void *arg)
 
     char segment[MAX_SEGMENT_SIZE];
     int res;
-    DEBUG_PRINT("Starting recviver handler\n");
+    DEBUG_PRINT("Starting receiver handler\n");
 
     while (1) {
 
@@ -51,9 +76,25 @@ void *receiver_handler(void *arg)
 
         pthread_mutex_lock(&cons[conn_id]->con_lock);
 
-        /* Handle segment received from the sender. We use this between locks
-        as to not have synchronization issues with the recv_data calls which are
-        on the main thread */
+    /* Handle segment received from the sender. We use this between locks
+    as to not have synchronization issues with the recv_data calls which are
+    on the main thread */
+        poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)segment;
+
+        if (hdr->type == 4) {
+            if (hdr->seq_num >= cons[conn_id]->expected_sequence_number) {
+                std::string payload(segment + sizeof(poli_tcp_data_hdr), hdr->len);
+                recv_buffers[conn_id][hdr->seq_num] = payload;
+            }
+
+            poli_tcp_ctrl_hdr ack_hdr = {};
+            ack_hdr.protocol_id = POLI_PROTOCOL_ID;
+            ack_hdr.conn_id = conn_id;
+            ack_hdr.type = 3;
+            ack_hdr.ack_num = hdr->seq_num;
+
+            sendto(cons[conn_id]->sockfd, &ack_hdr, sizeof(ack_hdr), 0, (struct sockaddr *)&cons[conn_id]->servaddr, sizeof(cons[conn_id]->servaddr));
+        }
 
         pthread_mutex_unlock(&cons[conn_id]->con_lock);
     }
@@ -119,15 +160,34 @@ int wait4connect(uint32_t ip, uint16_t port)
     syn_ack_header->recv_window = max_recv_buffer_bytes;
 
     memcpy(syn_ack + sizeof(poli_tcp_ctrl_hdr), &new_port, sizeof(uint16_t));
-    sendto(listen_sockfd, syn_ack, sizeof(poli_tcp_ctrl_hdr) + sizeof(uint16_t), MSG_CONFIRM, (const struct sockaddr *) &cliaddr, clilen);
 
     while (true) {
-        int n = recvfrom(con->sockfd, buffer, MAX_SEGMENT_SIZE, MSG_WAITALL, (struct sockaddr *) &cliaddr , &clilen);
-        if (n > 0) {
-            poli_tcp_ctrl_hdr *header = (poli_tcp_ctrl_hdr *)buffer;
-            if (header->type == 3) {
-                DEBUG_PRINT("Received ACK, connection established\n");
-                break;
+        sendto(listen_sockfd, syn_ack, sizeof(poli_tcp_ctrl_hdr) + sizeof(uint16_t), 0, (const struct sockaddr *) &cliaddr, clilen);
+
+        struct pollfd pfd;
+        pfd.fd = con->sockfd;
+        pfd.events = POLLIN;
+        int p = poll(&pfd, 1, 10);
+
+        if (p > 0) {
+            int n = recvfrom(con->sockfd, buffer, MAX_SEGMENT_SIZE, 0, (struct sockaddr *) &cliaddr , &clilen);
+            if (n > 0) {
+                poli_tcp_ctrl_hdr *header = (poli_tcp_ctrl_hdr *)buffer;
+                if (header->type == 3) {
+                    break;
+                } else if (header->type == 4) {
+                    poli_tcp_data_hdr *dhdr = (poli_tcp_data_hdr *)buffer;
+                    std::string payload(buffer + sizeof(poli_tcp_data_hdr), dhdr->len);
+                    recv_buffers[conn_id][dhdr->seq_num] = payload;
+
+                    poli_tcp_ctrl_hdr ack_hdr = {};
+                    ack_hdr.protocol_id = POLI_PROTOCOL_ID;
+                    ack_hdr.conn_id = conn_id;
+                    ack_hdr.type = 3;
+                    ack_hdr.ack_num = dhdr->seq_num;
+                    sendto(con->sockfd, &ack_hdr, sizeof(ack_hdr), 0, (struct sockaddr *)&cliaddr, clilen);
+                    break;
+                }
             }
         }
     }
@@ -148,10 +208,10 @@ int wait4connect(uint32_t ip, uint16_t port)
     timer_fds[fdmax].fd = timerfd_create(CLOCK_REALTIME,  0);    
     timer_fds[fdmax].events = POLLIN;    
     struct itimerspec spec;     
-    spec.it_value.tv_sec = 1;    
-    spec.it_value.tv_nsec = 0;    
-    spec.it_interval.tv_sec = 1;    
-    spec.it_interval.tv_nsec = 0;    
+    spec.it_value.tv_sec = 0;    
+    spec.it_value.tv_nsec = 10000000;    
+    spec.it_interval.tv_sec = 0;    
+    spec.it_interval.tv_nsec = 10000000;    
     timerfd_settime(timer_fds[fdmax].fd, 0, &spec, NULL);    
     fdmax++;    
 
@@ -175,7 +235,7 @@ void init_receiver(int recv_buffer_bytes)
     assert(listen_sockfd >= 0);
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(8031);
+    server_addr.sin_port = htons(8032);
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
     ret = bind(listen_sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
