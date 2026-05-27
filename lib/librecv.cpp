@@ -74,32 +74,34 @@ void *receiver_handler(void *arg)
             res = recv_message_or_timeout(segment, MAX_SEGMENT_SIZE, &conn_id);
         } while(res == -14);
 
-        pthread_mutex_lock(&cons[conn_id]->con_lock);
+        if (res > 0 && conn_id >= 0 && cons.find(conn_id) != cons.end()) {
+            
+            pthread_mutex_lock(&cons[conn_id]->con_lock);
 
-    /* Handle segment received from the sender. We use this between locks
-    as to not have synchronization issues with the recv_data calls which are
-    on the main thread */
-        poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)segment;
+            /* Handle segment received from the sender. */
+            poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)segment;
 
-        if (hdr->type == 4) {
-            if (hdr->seq_num >= cons[conn_id]->expected_sequence_number) {
-                std::string payload(segment + sizeof(poli_tcp_data_hdr), hdr->len);
-                recv_buffers[conn_id][hdr->seq_num] = payload;
+            if (hdr->type == 4) {
+                if (hdr->seq_num >= cons[conn_id]->expected_sequence_number) {
+                    std::string payload(segment + sizeof(poli_tcp_data_hdr), hdr->len);
+                    recv_buffers[conn_id][hdr->seq_num] = payload;
+                }
+
+                poli_tcp_ctrl_hdr ack_hdr = {};
+                ack_hdr.protocol_id = POLI_PROTOCOL_ID;
+                ack_hdr.conn_id = conn_id;
+                ack_hdr.type = 3;
+                ack_hdr.ack_num = hdr->seq_num;
+
+                sendto(cons[conn_id]->sockfd, &ack_hdr, sizeof(ack_hdr), 0, 
+                       (struct sockaddr *)&cons[conn_id]->servaddr, sizeof(cons[conn_id]->servaddr));
             }
 
-            poli_tcp_ctrl_hdr ack_hdr = {};
-            ack_hdr.protocol_id = POLI_PROTOCOL_ID;
-            ack_hdr.conn_id = conn_id;
-            ack_hdr.type = 3;
-            ack_hdr.ack_num = hdr->seq_num;
-
-            sendto(cons[conn_id]->sockfd, &ack_hdr, sizeof(ack_hdr), 0, (struct sockaddr *)&cons[conn_id]->servaddr, sizeof(cons[conn_id]->servaddr));
+            pthread_mutex_unlock(&cons[conn_id]->con_lock);
         }
-
-        pthread_mutex_unlock(&cons[conn_id]->con_lock);
     }
-
     
+    return NULL;
 }
 
 int wait4connect(uint32_t ip, uint16_t port)
@@ -127,7 +129,7 @@ int wait4connect(uint32_t ip, uint16_t port)
     DEBUG_PRINT("Waiting for SYN\n");
 
     while (true) {
-        int n = recvfrom(listen_sockfd, buffer, MAX_SEGMENT_SIZE, MSG_WAITALL, (struct sockaddr *) &cliaddr , &clilen);
+        int n = recvfrom(listen_sockfd, buffer, MAX_SEGMENT_SIZE, 0, (struct sockaddr *) &cliaddr , &clilen);
         if (n > 0) {
             poli_tcp_ctrl_hdr *header = (poli_tcp_ctrl_hdr *)buffer;
             if (header->type == 1) {

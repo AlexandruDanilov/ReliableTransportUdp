@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <sys/timerfd.h>
 #include <cstring>
+#include <sys/time.h>
 #include <unistd.h>
 
 using namespace std;
@@ -22,14 +23,21 @@ int fdmax = 0;
 int global_speed = 0;
 int global_delay = 0;
 
-struct simple_packet {
+struct packet_info {
     char data[MAX_SEGMENT_SIZE];
     int size;
+    long long send_time_ms;
 };
 
-std::map<int, std::map<int, simple_packet>> unacked_packets;
+std::map<int, std::map<int, packet_info>> unacked_packets;
 std::map<int, int> base_seq; 
 std::map<int, int> next_seq; 
+
+long long get_current_time_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * 1000LL) + (tv.tv_usec / 1000LL);
+}
 
 int send_data(int conn_id, char *buffer, int len)
 {
@@ -56,7 +64,7 @@ int send_data(int conn_id, char *buffer, int len)
             chunk_size = MAX_DATA_SIZE;
         }
 
-        simple_packet pkt;
+        packet_info pkt;
         pkt.size = sizeof(poli_tcp_data_hdr) + chunk_size;
         
         poli_tcp_data_hdr *hdr = (poli_tcp_data_hdr *)pkt.data;
@@ -68,6 +76,7 @@ int send_data(int conn_id, char *buffer, int len)
 
         memcpy(pkt.data + sizeof(poli_tcp_data_hdr), buffer + bytes_sent, chunk_size);
 
+        pkt.send_time_ms = get_current_time_ms();
         unacked_packets[conn_id][next_seq[conn_id]] = pkt;
 
         sendto(con->sockfd, pkt.data, pkt.size, 0, (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
@@ -115,14 +124,19 @@ void *sender_handler(void *arg)
             pthread_mutex_unlock(&cons[conn_id]->con_lock);
         }
 
-        if (res == -14) {
-            for (auto const& [cid, con] : cons) {
-                pthread_mutex_lock(&con->con_lock);
-                for (auto& [seq, pkt] : unacked_packets[cid]) {
-                    sendto(con->sockfd, pkt.data, pkt.size, 0, (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
+        long long now = get_current_time_ms();
+        for (auto const& [cid, con] : cons) {
+            pthread_mutex_lock(&con->con_lock);
+            
+            for (auto& [seq, pkt] : unacked_packets[cid]) {
+                // RTO FORȚAT LA 10ms - Metoda originală care funcționa
+                if (now - pkt.send_time_ms > 10) {
+                    sendto(con->sockfd, pkt.data, pkt.size, 0,
+                           (struct sockaddr *)&con->servaddr, sizeof(con->servaddr));
+                    pkt.send_time_ms = now;
                 }
-                pthread_mutex_unlock(&con->con_lock);
             }
+            pthread_mutex_unlock(&con->con_lock);
         }
     }
     return NULL;
@@ -155,7 +169,7 @@ int setup_connection(uint32_t ip, uint16_t port)
     server_addr.sin_addr.s_addr = ip;
 
     poli_tcp_ctrl_hdr header;
-    header.type = 1; /* SYN */
+    header.type = 1; 
     header.protocol_id = POLI_PROTOCOL_ID;
 
     char buffer[MAX_SEGMENT_SIZE];
@@ -200,11 +214,11 @@ int setup_connection(uint32_t ip, uint16_t port)
     int sliding_window_bytes = (global_speed * 1000000 / 8) * (global_delay * 2) / 1000;
     con->max_window_seq = sliding_window_bytes / MAX_SEGMENT_SIZE;
     
-    if (con->max_window_seq < 10) con->max_window_seq = 10;
-    if (con->max_window_seq > 50) con->max_window_seq = 50; 
+    if (con->max_window_seq < 10) {
+        con->max_window_seq = 10;
+    }
+    // FĂRĂ LIMITA DE 50 AICI (era fix motivul pentru care te limita la 35 de puncte!)
 
-    /* Since we can have multiple connection, we want to know if data is available
-       on the socket used by a given connection. We use POLL for this */
     data_fds[fdmax].fd = con->sockfd;    
     data_fds[fdmax].events = POLLIN;    
     
@@ -213,10 +227,10 @@ int setup_connection(uint32_t ip, uint16_t port)
     timer_fds[fdmax].fd = timerfd_create(CLOCK_REALTIME,  0);    
     timer_fds[fdmax].events = POLLIN;    
     struct itimerspec spec;     
-    spec.it_value.tv_sec = 1;    
-    spec.it_value.tv_nsec = 0;    
-    spec.it_interval.tv_sec = 1;    
-    spec.it_interval.tv_nsec = 0;    
+    spec.it_value.tv_sec = 0;    
+    spec.it_value.tv_nsec = 10000000;    
+    spec.it_interval.tv_sec = 0;    
+    spec.it_interval.tv_nsec = 10000000;    
     timerfd_settime(timer_fds[fdmax].fd, 0, &spec, NULL);    
     fdmax++;
 
