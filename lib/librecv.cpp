@@ -109,7 +109,7 @@ int wait4connect(uint32_t ip, uint16_t port)
     /* TODO: Implement the Three Way Handshake on the receiver part. This blocks
      * until a connection is established. */
 
-    struct connection *con = (struct connection *)malloc(sizeof(struct connection));
+    struct connection *con = (struct connection *)calloc(1, sizeof(struct connection));
     int conn_id = next_connection_id++;
 
     /* This can be used to set a timer on a socket, useful once we received a
@@ -123,7 +123,7 @@ int wait4connect(uint32_t ip, uint16_t port)
     } */
 
     char buffer[MAX_SEGMENT_SIZE];
-    struct sockaddr_in cliaddr;
+    struct sockaddr_in cliaddr = {};
     socklen_t clilen = sizeof(cliaddr);
 
     DEBUG_PRINT("Waiting for SYN\n");
@@ -143,7 +143,7 @@ int wait4connect(uint32_t ip, uint16_t port)
     /* Receive SYN on the connection socket. Create a new socket and bind it to
      * the chosen port. Send the data port number via SYN-ACK to the client */
     con->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in new_server_addr;
+    struct sockaddr_in new_server_addr = {};
     new_server_addr.sin_family = AF_INET;
     new_server_addr.sin_port = htons(0);
     new_server_addr.sin_addr.s_addr = INADDR_ANY;
@@ -166,7 +166,7 @@ int wait4connect(uint32_t ip, uint16_t port)
     while (true) {
         sendto(listen_sockfd, syn_ack, sizeof(poli_tcp_ctrl_hdr) + sizeof(uint16_t), 0, (const struct sockaddr *) &cliaddr, clilen);
 
-        struct pollfd pfd;
+        struct pollfd pfd = {};
         pfd.fd = con->sockfd;
         pfd.events = POLLIN;
         int p = poll(&pfd, 1, 10);
@@ -209,7 +209,7 @@ int wait4connect(uint32_t ip, uint16_t port)
        to know if a timeout has happend on a connection */
     timer_fds[fdmax].fd = timerfd_create(CLOCK_REALTIME,  0);    
     timer_fds[fdmax].events = POLLIN;    
-    struct itimerspec spec;     
+    struct itimerspec spec = {};     
     spec.it_value.tv_sec = 0;    
     spec.it_value.tv_nsec = 10000000;    
     spec.it_interval.tv_sec = 0;    
@@ -235,7 +235,7 @@ void init_receiver(int recv_buffer_bytes)
     max_recv_buffer_bytes = recv_buffer_bytes;
     listen_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     assert(listen_sockfd >= 0);
-    struct sockaddr_in server_addr;
+    struct sockaddr_in server_addr = {};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(8032);
     server_addr.sin_addr.s_addr = INADDR_ANY;

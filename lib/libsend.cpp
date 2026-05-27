@@ -34,7 +34,7 @@ std::map<int, int> base_seq;
 std::map<int, int> next_seq; 
 
 long long get_current_time_ms() {
-    struct timeval tv;
+    struct timeval tv = {};
     gettimeofday(&tv, NULL);
     return (tv.tv_sec * 1000LL) + (tv.tv_usec / 1000LL);
 }
@@ -147,7 +147,7 @@ int setup_connection(uint32_t ip, uint16_t port)
     /* Implement the sender part of the Three Way Handshake. Blocks
     until the connection is established */
 
-    struct connection *con = (struct connection *)malloc(sizeof(struct connection));
+    struct connection *con = (struct connection *)calloc(1, sizeof(struct connection));
     int conn_id = 0;
     con->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -163,17 +163,17 @@ int setup_connection(uint32_t ip, uint16_t port)
      * port. We can use con->sockfd for both cases, but we will need to update server_addr
      * with the port received via SYN-ACK */
 
-    struct sockaddr_in server_addr;
+    struct sockaddr_in server_addr = {};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = port;
     server_addr.sin_addr.s_addr = ip;
 
-    poli_tcp_ctrl_hdr header;
+    poli_tcp_ctrl_hdr header = {};
     header.type = 1; 
     header.protocol_id = POLI_PROTOCOL_ID;
 
     char buffer[MAX_SEGMENT_SIZE];
-    struct sockaddr_in from_addr;
+    struct sockaddr_in from_addr = {};
     socklen_t from_len = sizeof(from_addr);
     uint16_t new_port = 0;
 
@@ -181,7 +181,7 @@ int setup_connection(uint32_t ip, uint16_t port)
 
         sendto(con->sockfd, &header, sizeof(header), 0, (const struct sockaddr *) &server_addr, sizeof(server_addr));
         
-        struct pollfd pfd;
+        struct pollfd pfd = {};
         pfd.fd = con->sockfd;
         pfd.events = POLLIN;
         int p = poll(&pfd, 1, 10);
@@ -201,7 +201,7 @@ int setup_connection(uint32_t ip, uint16_t port)
 
     server_addr.sin_port = htons(new_port);
     con->servaddr = server_addr;
-    poli_tcp_ctrl_hdr syn_ack_header;
+    poli_tcp_ctrl_hdr syn_ack_header = {};
     syn_ack_header.protocol_id = POLI_PROTOCOL_ID;
     syn_ack_header.conn_id = conn_id;
     syn_ack_header.type = 3;
@@ -226,7 +226,7 @@ int setup_connection(uint32_t ip, uint16_t port)
        to know if a timeout has happend on our connection */
     timer_fds[fdmax].fd = timerfd_create(CLOCK_REALTIME,  0);    
     timer_fds[fdmax].events = POLLIN;    
-    struct itimerspec spec;     
+    struct itimerspec spec = {};     
     spec.it_value.tv_sec = 0;    
     spec.it_value.tv_nsec = 10000000;    
     spec.it_interval.tv_sec = 0;    
