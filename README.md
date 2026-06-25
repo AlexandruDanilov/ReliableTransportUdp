@@ -1,5 +1,4 @@
-# Reliable Transport over UDP - Danilov Alexandru, 325CA
-
+# Reliable Transport over UDP
 ## General information
 This project implements a custom protocol on top of UDP, which targets the issue of UDP's lack 
 of reliability. It is designed to handle file and image transfer across a really bad network, 
